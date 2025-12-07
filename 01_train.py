@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import torch
 from datetime import datetime
+import json
 
 from anomalib.data import Folder
 from anomalib.engine import Engine
@@ -83,7 +84,7 @@ model = EfficientAd(
 # 4. 학습 엔진 설정
 # ============================================
 engine = Engine(
-    max_epochs=30,
+    max_epochs=40,
     accelerator="auto",
     devices=1,
     default_root_dir=RESULTS_DIR,
@@ -92,8 +93,28 @@ engine = Engine(
 # ============================================
 # 5. MLflow 학습 시작
 # ============================================
-# Run name 생성: 제품종류_년월일_시분초
-run_name = f"{CATEGORY}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+# 모델 버전 확인 (학습 전 기존 버전 확인하여 다음 버전 예측)
+results_path = Path(RESULTS_DIR) / "EfficientAd" / CATEGORY
+next_version = 0
+if results_path.exists():
+    versions = [d for d in results_path.iterdir() if d.is_dir() and d.name.startswith('v')]
+    if versions:
+        # 기존 버전 중 최대값 찾기
+        version_numbers = [int(v.name[1:]) for v in versions if v.name[1:].isdigit()]
+        if version_numbers:
+            next_version = max(version_numbers) + 1
+        else:
+            next_version = 1
+    else:
+        next_version = 0
+else:
+    next_version = 0
+
+# Run name 생성: 제품명_모델버전_년월일_시분초
+run_name = f"{CATEGORY}_v{next_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+print(f"📝 MLflow Run Name: {run_name}")
+print(f"📦 예상 모델 버전: v{next_version}")
 
 with mlflow.start_run(run_name=run_name):
     # 하이퍼파라미터 로깅
@@ -103,7 +124,7 @@ with mlflow.start_run(run_name=run_name):
         "model_size": "small",
         "lr": 0.0001,
         "weight_decay": 0.00001,
-        "max_epochs": 1000,
+        "max_epochs": 40,
         "image_size": "256x256",
     })
     
@@ -115,12 +136,25 @@ with mlflow.start_run(run_name=run_name):
     versions = [d for d in results_path.iterdir() if d.is_dir() and d.name.startswith('v')]
     if versions:
         latest_version = max(versions, key=lambda x: int(x.name[1:]) if x.name[1:].isdigit() else 0)
+        actual_version = latest_version.name  # v0, v1, v2 등
+        actual_version_num = int(actual_version[1:]) if actual_version[1:].isdigit() else 0
+        
+        # 실제 버전을 태그로 저장
+        mlflow.set_tag("model_version", actual_version)
+        mlflow.set_tag("model_version_number", str(actual_version_num))
+        
         ckpt_path = latest_version / "weights" / "lightning" / "model.ckpt"
         if not ckpt_path.exists():
             ckpt_path = list(latest_version.glob("**/model.ckpt"))[0]
         
         # 체크포인트를 artifact로 저장
         mlflow.log_artifact(str(ckpt_path), "checkpoints")
+        print(f"💾 체크포인트 저장: {ckpt_path}")
+        print(f"📦 실제 모델 버전: {actual_version}")
+        
+        # 예상 버전과 실제 버전이 다른 경우 알림
+        if actual_version_num != next_version:
+            print(f"⚠️ 예상 버전(v{next_version})과 실제 버전({actual_version})이 다릅니다.")
     
     # 모델 평가
     test_results = engine.test(datamodule=datamodule, model=model)
@@ -223,31 +257,32 @@ with mlflow.start_run(run_name=run_name):
         y_scores = np.array(y_scores)
         
         # Precision-Recall curve로 threshold 후보 찾기
-        thresholds = precision_recall_curve(y_test, y_scores, pos_label=0)[2]
+        # anomalib: 양품=0, 불량=1, 높은 score=비정상
+        # pos_label=1: 불량이 positive class
+        thresholds = precision_recall_curve(y_test, y_scores, pos_label=1)[2]
         
         # F1 스코어를 최대화하는 threshold 값 찾기
-        f1Scores = [f1_score(y_test, (y_scores <= threshold).astype(int), pos_label=0) for threshold in thresholds]
+        # anomalib: 양품=0, 불량=1, 높은 score=비정상
+        # 따라서 score >= threshold면 비정상(1), score < threshold면 정상(0)
+        f1Scores = [f1_score(y_test, (y_scores >= threshold).astype(int), pos_label=1) for threshold in thresholds]
         threshold = thresholds[np.argmax(f1Scores)]
         
-        # AUROC 계산
-        fpr, tpr = roc_curve(y_true=y_test, y_score=y_scores, pos_label=0)[:2]
+        # AUROC 계산 (pos_label=1: 불량이 positive class)
+        fpr, tpr = roc_curve(y_true=y_test, y_score=y_scores, pos_label=1)[:2]
         auc = auc_score(fpr, tpr) * 100
         
         # DataFrame 생성
-        productTrue = ["NG" if i == 0 else "OK" for i in y_test]
-        productPred = ["NG" if score >= threshold else "OK" for score in y_scores]
         thresholdDf = pd.DataFrame({
-            "product_true": productTrue,
-            "product_pred": productPred,
+            "product_true": ["OK" if i == 0 else "NG" for i in y_test],
             "y_scores": y_scores
         })
         
-        # Good threshold (양품 최대 anomaly score)
-        goodDf = thresholdDf[(thresholdDf['product_true'] == 'OK') & (thresholdDf['product_pred'] == 'OK')]
+        # Good threshold: 실제 정상인 모든 샘플들의 최대 anomaly score
+        goodDf = thresholdDf[thresholdDf['product_true'] == 'OK']
         goodThreshold = goodDf["y_scores"].max() if len(goodDf) > 0 else None
         
-        # Bad threshold (불량 최저 anomaly score)
-        badDf = thresholdDf[(thresholdDf['product_true'] == 'NG') & (thresholdDf['product_pred'] == 'NG')]
+        # Bad threshold: 실제 불량인 모든 샘플들의 최소 anomaly score
+        badDf = thresholdDf[thresholdDf['product_true'] == 'NG']
         badThreshold = badDf["y_scores"].min() if len(badDf) > 0 else None
         
         # Best threshold: good과 bad의 평균으로 산정
@@ -264,7 +299,9 @@ with mlflow.start_run(run_name=run_name):
             bestThreshold = threshold
         
         # Accuracy 계산
-        y_pred = [0 if i >= bestThreshold else 1 for i in y_scores]
+        # anomalib: 양품=0, 불량=1, 높은 score=비정상
+        # 따라서 score >= threshold면 비정상(1), score < threshold면 정상(0)
+        y_pred = [1 if i >= bestThreshold else 0 for i in y_scores]
         accuracy = accuracy_score(y_true=y_test, y_pred=y_pred) * 100
         
         return bestThreshold, goodThreshold, badThreshold, accuracy, auc, threshold
@@ -275,6 +312,32 @@ with mlflow.start_run(run_name=run_name):
     )
     
     if bestThreshold is not None:
+        # ============================================
+        # 모델 내부 속성으로 threshold 저장
+        # ============================================
+        # register_buffer를 사용하여 state_dict에 포함 (모델 저장 시 함께 저장됨)
+        model.register_buffer("best_threshold", torch.tensor(bestThreshold, dtype=torch.float32))
+        if goodThreshold is not None:
+            model.register_buffer("good_threshold", torch.tensor(goodThreshold, dtype=torch.float32))
+        else:
+            model.register_buffer("good_threshold", torch.tensor(0.0, dtype=torch.float32))
+        
+        if badThreshold is not None:
+            model.register_buffer("bad_threshold", torch.tensor(badThreshold, dtype=torch.float32))
+        else:
+            model.register_buffer("bad_threshold", torch.tensor(0.0, dtype=torch.float32))
+        
+        # 추가 메타데이터를 모델 속성으로 저장 (state_dict에는 포함되지 않지만 모델 객체에 저장됨)
+        model.threshold_accuracy = float(accuracy)
+        model.threshold_auc = float(auc)
+        model.threshold_category = CATEGORY
+        model.initial_threshold = float(initial_threshold)
+        
+        print(f"✅ Threshold를 모델 속성으로 저장 완료:")
+        print(f"  - best_threshold: {bestThreshold:.4f}")
+        print(f"  - good_threshold: {goodThreshold:.4f}" if goodThreshold is not None else "  - good_threshold: None")
+        print(f"  - bad_threshold: {badThreshold:.4f}" if badThreshold is not None else "  - bad_threshold: None")
+        
         # Threshold 관련 메트릭 로깅
         mlflow.log_metrics({
             "best_threshold": bestThreshold,
@@ -284,12 +347,29 @@ with mlflow.start_run(run_name=run_name):
             "threshold_auc": auc,
         })
         
+        # Threshold 정보를 JSON 파일로 저장 (모델과 함께 저장)
+        threshold_info = {
+            "best_threshold": float(bestThreshold),
+            "good_threshold": float(goodThreshold) if goodThreshold is not None else None,
+            "bad_threshold": float(badThreshold) if badThreshold is not None else None,
+            "threshold_accuracy": float(accuracy),
+            "threshold_auc": float(auc),
+            "initial_threshold": float(initial_threshold),
+            "category": CATEGORY,
+            "model_name": "EfficientAD",
+        }
+        with open("threshold_info.json", "w", encoding="utf-8") as f:
+            json.dump(threshold_info, f, indent=2, ensure_ascii=False)
+        mlflow.log_artifact("threshold_info.json")
+        
         # 예측 결과 DataFrame 저장
+        # anomalib: 양품=0, 불량=1, 높은 score=비정상
+        # 따라서 score >= threshold면 비정상(1), score < threshold면 정상(0)
         df = pd.DataFrame({
             "image_path": paths,
             "gt_label": y_test,
             "pred_score": y_scores,
-            "pred_label": [0 if score >= bestThreshold else 1 for score in y_scores],
+            "pred_label": [1 if score >= bestThreshold else 0 for score in y_scores],
         })
         df.to_csv("predictions.csv", index=False, encoding='utf-8-sig')
         mlflow.log_artifact("predictions.csv")
@@ -301,9 +381,60 @@ with mlflow.start_run(run_name=run_name):
         # anomaly_images 폴더 전체를 artifact로 저장 (불량 유형별 폴더 구조 유지)
         mlflow.log_artifacts("anomaly_images", "anomaly_segmentation")
     
-    # 모델 저장
-    mlflow.pytorch.log_model(model, "model")
+    # 모델 저장 (threshold 정보와 함께)
+    from mlflow.models import infer_signature
     
-    print("✅ MLflow 로깅 완료!")
+    # Signature 생성용 샘플 데이터
+    sample_batch = next(iter(datamodule.test_dataloader()))
+    sample_input = sample_batch["image"][:1]  # 첫 번째 이미지만
+    
+    # 모델을 eval 모드로 설정하고 예측
+    model.eval()
+    with torch.no_grad():
+        sample_output = model(sample_input)
+    
+    # Signature 추론 (output이 dict인 경우 처리)
+    if isinstance(sample_output, dict):
+        output_data = sample_output.get("pred_score", sample_output.get("anomaly_map", list(sample_output.values())[0]))
+        if hasattr(output_data, "numpy"):
+            output_data = output_data.numpy()
+    else:
+        output_data = sample_output.numpy() if hasattr(sample_output, "numpy") else sample_output
+    
+    signature = infer_signature(sample_input.numpy(), output_data)
+    
+    # Threshold 정보를 태그로 저장 (모델과 함께 추적 가능)
+    if bestThreshold is not None:
+        mlflow.set_tag("best_threshold", str(bestThreshold))
+        if goodThreshold is not None:
+            mlflow.set_tag("good_threshold", str(goodThreshold))
+        if badThreshold is not None:
+            mlflow.set_tag("bad_threshold", str(badThreshold))
+        mlflow.set_tag("threshold_category", CATEGORY)
+    
+    # 모델 저장 (signature와 input_example 포함)
+    mlflow.pytorch.log_model(
+        pytorch_model=model,
+        artifact_path="model",
+        signature=signature,
+        input_example=sample_input.numpy(),
+    )
+    
+    # 모델 내부 threshold 속성 확인
+    if bestThreshold is not None:
+        print("\n📊 모델 내부 threshold 속성 확인:")
+        print(f"  - model.best_threshold: {model.best_threshold.item():.4f}")
+        print(f"  - model.good_threshold: {model.good_threshold.item():.4f}")
+        print(f"  - model.bad_threshold: {model.bad_threshold.item():.4f}")
+        print(f"  - model.threshold_accuracy: {model.threshold_accuracy:.2f}%")
+        print(f"  - model.threshold_auc: {model.threshold_auc:.2f}%")
+        print(f"  - model.threshold_category: {model.threshold_category}")
+        print("\n💡 모델 로드 시 threshold 사용 방법:")
+        print("  loaded_model = mlflow.pytorch.load_model(model_uri)")
+        print("  threshold = loaded_model.best_threshold.item()")
+        print("  # 또는")
+        print("  threshold = loaded_model.best_threshold.cpu().numpy()")
+    
+    print("\n✅ MLflow 로깅 완료!")
 
 print("🎉 모든 작업 완료!")
