@@ -1,4 +1,8 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 from pathlib import Path
+from anomalib.data.utils import ValSplitMode, TestSplitMode
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -25,6 +29,7 @@ import mlflow.pytorch
 # 1. 설정
 # ============================================
 DATA_ROOT = "./datasets/MVTecAD/capsule"
+TEST_ROOT = "./datasets/MVTecAD/capsule/test"
 CATEGORY = "capsule"
 RESULTS_DIR = "./results"
 MLFLOW_TRACKING_URI = "./mlruns"
@@ -38,25 +43,68 @@ mlflow.set_experiment(f"EfficientAD_{CATEGORY}")
 # ============================================
 resize_transform = Resize(size=(256, 256))
 
-datamodule = Folder(
-    name=CATEGORY,
+# 학습용 데이터셋: 양품(good)만 사용
+train_datamodule = Folder(
+    name=f"{CATEGORY}",
     root=DATA_ROOT,
     normal_dir="train/good",
-    abnormal_dir=[
-        "test/crack",
-        "test/faulty_imprint",
-        "test/poke",
-        "test/scratch",
-        "test/squeeze",
-    ],
-    normal_test_dir="test/good",
     train_batch_size=1,
     eval_batch_size=1,
     num_workers=0,
     augmentations=resize_transform,
+    # val_split_ratio=0,  # Validation split 없음
+    test_split_mode=TestSplitMode.NONE,
+    val_split_mode=ValSplitMode.SYNTHETIC,
+    val_split_ratio=0.25,
 )
 
-datamodule.setup()
+train_datamodule.setup()
+print(f"✅ 학습 데이터셋 로드 완료!")
+print(f"   - 학습용 양품 이미지: {len(train_datamodule.train_dataloader().dataset)}개")
+
+# Threshold/평가용 데이터셋: test 전체 (good + defects)
+# TEST_ROOT 전체를 test로 사용하고, val은 test와 동일하게 설정
+test_datamodule = Folder(
+    name=f"{CATEGORY}_test",
+    root=TEST_ROOT,          # ./capsule/test
+    normal_dir="good",
+    normal_test_dir="good",
+    abnormal_dir=[
+        "crack",
+        "faulty_imprint",
+        "poke",
+        "scratch",
+        "squeeze",
+    ],
+    train_batch_size=1,
+    eval_batch_size=1,
+    num_workers=0,
+    augmentations=resize_transform,
+    test_split_mode=TestSplitMode.FROM_DIR,   # TEST_ROOT 전체를 test로 사용
+    val_split_mode=ValSplitMode.SAME_AS_TEST,    # test에서 val 분리 (하지만 ratio=0이므로 동일)
+    seed=42,
+)
+
+test_datamodule.setup()
+
+# 실제 파일 개수와 dataset 개수 비교
+all_png = list(Path(TEST_ROOT).rglob("*.png"))
+# test_dataloader 사용 (TEST_ROOT 전체가 test로 설정됨)
+test_dataloader = test_datamodule.test_dataloader()
+test_dataset = test_dataloader.dataset
+
+print("✅ Threshold/평가용 데이터셋 로드 완료!")
+print(f"   - 실제 png 파일 개수 (TEST_ROOT): {len(all_png)}")
+print(f"   - test_dataset 크기             : {len(test_dataset)}개 이미지")
+print(f"   - test 배치 수                  : {len(test_dataloader)}개 배치")
+if len(test_dataset) < len(all_png):
+    print(f"   ⚠️ 경고: 데이터셋 크기({len(test_dataset)})가 실제 파일 수({len(all_png)})보다 적습니다!")
+    print(f"      차이: {len(all_png) - len(test_dataset)}개 파일이 누락되었습니다.")
+    print(f"   💡 디버깅: test_datamodule 구조 확인 중...")
+    if hasattr(test_datamodule, 'test_set'):
+        print(f"      - test_set 크기: {len(test_datamodule.test_set) if hasattr(test_datamodule.test_set, '__len__') else 'N/A'}")
+else:
+    print(f"   ✅ 모든 이미지가 로드되었습니다!")
 
 # ============================================
 # 3. 모델 설정
@@ -75,7 +123,7 @@ model = EfficientAd(
     lr=0.0001,
     weight_decay=0.00001,
     padding=False,
-    pad_maps=True,
+    pad_maps=False,
     evaluator=evaluator,
     pre_processor=pre_processor,
 )
@@ -83,8 +131,10 @@ model = EfficientAd(
 # ============================================
 # 4. 학습 엔진 설정
 # ============================================
+epochs = 5
+
 engine = Engine(
-    max_epochs=40,
+    max_epochs=epochs,
     accelerator="auto",
     devices=1,
     default_root_dir=RESULTS_DIR,
@@ -110,13 +160,21 @@ if results_path.exists():
 else:
     next_version = 0
 
+# 타임스탬프 생성 (학습 전에 생성하여 일관성 유지)
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
 # Run name 생성: 제품명_모델버전_년월일_시분초
-run_name = f"{CATEGORY}_v{next_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+# 주의: 학습 후 실제 버전이 다를 수 있으므로, 학습 후 확인 필요
+run_name = f"{CATEGORY}_v{next_version}_{timestamp}"
 
 print(f"📝 MLflow Run Name: {run_name}")
 print(f"📦 예상 모델 버전: v{next_version}")
+print(f"⏰ 타임스탬프: {timestamp}")
 
 with mlflow.start_run(run_name=run_name):
+    # 예상 버전을 태그로 저장
+    mlflow.set_tag("expected_version", f"v{next_version}")
+    mlflow.set_tag("timestamp", timestamp)
     # 하이퍼파라미터 로깅
     mlflow.log_params({
         "model": "EfficientAD",
@@ -124,12 +182,13 @@ with mlflow.start_run(run_name=run_name):
         "model_size": "small",
         "lr": 0.0001,
         "weight_decay": 0.00001,
-        "max_epochs": 40,
+        "max_epochs": epochs,
         "image_size": "256x256",
     })
     
-    # 모델 학습
-    engine.fit(datamodule=datamodule, model=model)
+    # 모델 학습 (양품만 사용)
+    print("🚀 모델 학습을 시작합니다... (양품 데이터만 사용)")
+    engine.fit(datamodule=train_datamodule, model=model)
     
     # 학습 후 체크포인트 경로 찾기
     results_path = Path(RESULTS_DIR) / "EfficientAd" / CATEGORY
@@ -142,6 +201,7 @@ with mlflow.start_run(run_name=run_name):
         # 실제 버전을 태그로 저장
         mlflow.set_tag("model_version", actual_version)
         mlflow.set_tag("model_version_number", str(actual_version_num))
+        mlflow.set_tag("actual_version", actual_version)  # 명확한 태그
         
         ckpt_path = latest_version / "weights" / "lightning" / "model.ckpt"
         if not ckpt_path.exists():
@@ -152,12 +212,21 @@ with mlflow.start_run(run_name=run_name):
         print(f"💾 체크포인트 저장: {ckpt_path}")
         print(f"📦 실제 모델 버전: {actual_version}")
         
-        # 예상 버전과 실제 버전이 다른 경우 알림
+        # 예상 버전과 실제 버전 비교 및 일치 여부 확인
         if actual_version_num != next_version:
-            print(f"⚠️ 예상 버전(v{next_version})과 실제 버전({actual_version})이 다릅니다.")
+            print(f"\n⚠️ 경고: 예상 버전(v{next_version})과 실제 버전({actual_version})이 다릅니다!")
+            print(f"   - MLflow Run Name: {run_name}")
+            print(f"   - 실제 모델 버전: {actual_version}")
+            print(f"   - MLflow에서 'actual_version' 태그로 실제 버전을 확인하세요.")
+            mlflow.set_tag("version_mismatch", "true")
+            mlflow.set_tag("version_mismatch_info", f"expected_v{next_version}_actual_{actual_version}")
+        else:
+            print(f"✅ 버전 일치 확인: 예상 버전(v{next_version})과 실제 버전({actual_version})이 일치합니다.")
+            mlflow.set_tag("version_mismatch", "false")
     
-    # 모델 평가
-    test_results = engine.test(datamodule=datamodule, model=model)
+    # 모델 평가 (Test 데이터셋으로)
+    print("📊 모델 평가 중... (Test 데이터셋 사용)")
+    test_results = engine.test(datamodule=test_datamodule, model=model)
     
     # 평가 결과 로깅
     for result in test_results:
@@ -167,14 +236,17 @@ with mlflow.start_run(run_name=run_name):
     # ============================================
     # 6. Test 셋 전체 예측 및 Threshold 계산
     # ============================================
-    print("🔍 Test 셋 전체 예측 중...")
-    predictions = engine.predict(model=model, datamodule=datamodule)
+    print("🔍 Test 셋 전체 예측 중... (Threshold 계산용)")
+    predictions = engine.predict(model=model, datamodule=test_datamodule)
+    
+    print(f"✅ 예측 완료! 총 {len(predictions)} 배치")
     
     # 예측 결과 수집
     y_test = []
     y_scores = []
     paths = []
     anomaly_images = []  # 불량으로 판단한 이미지들
+    total_processed = 0
     
     def extract_defect_type(image_path: str) -> str:
         """이미지 경로에서 불량 유형 추출"""
@@ -199,6 +271,7 @@ with mlflow.start_run(run_name=run_name):
     for batch in predictions:
         batch_size = batch.image.shape[0]
         for i in range(batch_size):
+            total_processed += 1
             image_path = batch.image_path[i] if hasattr(batch, 'image_path') else None
             gt_label = batch.gt_label[i].item() if hasattr(batch, 'gt_label') else None
             pred_score = batch.pred_score[i].item() if hasattr(batch, 'pred_score') else None
@@ -271,18 +344,23 @@ with mlflow.start_run(run_name=run_name):
         fpr, tpr = roc_curve(y_true=y_test, y_score=y_scores, pos_label=1)[:2]
         auc = auc_score(fpr, tpr) * 100
         
-        # DataFrame 생성
+        # DataFrame 생성 (초기 threshold로 예측 결과 포함)
+        productTrue = ["OK" if i == 0 else "NG" for i in y_test]
+        productPred = ["OK" if score < threshold else "NG" for score in y_scores]
         thresholdDf = pd.DataFrame({
-            "product_true": ["OK" if i == 0 else "NG" for i in y_test],
+            "product_true": productTrue,
+            "product_pred": productPred,
             "y_scores": y_scores
         })
         
-        # Good threshold: 실제 정상인 모든 샘플들의 최대 anomaly score
-        goodDf = thresholdDf[thresholdDf['product_true'] == 'OK']
+        # Good threshold: 실제 정상이고 예측도 정상인 샘플들의 최대 anomaly score
+        # (모델이 올바르게 예측한 정상 샘플만 고려)
+        goodDf = thresholdDf[(thresholdDf['product_true'] == 'OK') & (thresholdDf['product_pred'] == 'OK')]
         goodThreshold = goodDf["y_scores"].max() if len(goodDf) > 0 else None
         
-        # Bad threshold: 실제 불량인 모든 샘플들의 최소 anomaly score
-        badDf = thresholdDf[thresholdDf['product_true'] == 'NG']
+        # Bad threshold: 실제 불량이고 예측도 불량인 샘플들의 최소 anomaly score
+        # (모델이 올바르게 예측한 불량 샘플만 고려)
+        badDf = thresholdDf[(thresholdDf['product_true'] == 'NG') & (thresholdDf['product_pred'] == 'NG')]
         badThreshold = badDf["y_scores"].min() if len(badDf) > 0 else None
         
         # Best threshold: good과 bad의 평균으로 산정
@@ -394,7 +472,7 @@ with mlflow.start_run(run_name=run_name):
     from mlflow.models import infer_signature
     
     # Signature 생성용 샘플 데이터
-    sample_batch = next(iter(datamodule.test_dataloader()))
+    sample_batch = next(iter(test_datamodule.test_dataloader()))
     sample_input = sample_batch["image"][:1]  # 첫 번째 이미지만
     
     # 모델을 eval 모드로 설정하고 예측
