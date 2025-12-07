@@ -347,7 +347,7 @@ with mlflow.start_run(run_name=run_name):
             "threshold_auc": auc,
         })
         
-        # Threshold 정보를 JSON 파일로 저장 (모델과 함께 저장)
+        # Threshold 정보를 JSON 파일로 저장 (모델 저장 경로에 함께 저장)
         threshold_info = {
             "best_threshold": float(bestThreshold),
             "good_threshold": float(goodThreshold) if goodThreshold is not None else None,
@@ -358,6 +358,15 @@ with mlflow.start_run(run_name=run_name):
             "category": CATEGORY,
             "model_name": "EfficientAD",
         }
+        
+        # 모델 저장 경로에 threshold_info.json 저장
+        if versions:
+            threshold_json_path = latest_version / "threshold_info.json"
+            with open(threshold_json_path, "w", encoding="utf-8") as f:
+                json.dump(threshold_info, f, indent=2, ensure_ascii=False)
+            print(f"💾 Threshold 정보 저장: {threshold_json_path}")
+        
+        # MLflow에도 artifact로 저장
         with open("threshold_info.json", "w", encoding="utf-8") as f:
             json.dump(threshold_info, f, indent=2, ensure_ascii=False)
         mlflow.log_artifact("threshold_info.json")
